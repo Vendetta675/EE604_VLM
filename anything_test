@@ -1,0 +1,21 @@
+import torch
+from PIL import Image
+from locateanything_worker import LocateAnythingWorker
+
+worker = LocateAnythingWorker("nvidia/LocateAnything-3B")
+img = Image.open("/home/gourav/example.jpeg").convert("RGB")
+
+# Object Detection
+print(worker.detect(img, ["person", "car", "bicycle"])["answer"])
+
+# Phrase Grounding
+print(worker.ground_multi(img, "people wearing red shirts")["answer"])
+
+# Scene Text Detection
+print(worker.detect_text(img)["answer"])
+
+# GUI Grounding (point)
+print(worker.ground_gui(img, "the search button", output_type="point")["answer"])
+
+# Pointing
+print(worker.point(img, "the traffic light")["answer"])

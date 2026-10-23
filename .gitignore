@@ -1,0 +1,8 @@
+.env
+data/
+.venv_*/
+.tmp/
+work_dirs/
+__pycache__/
+*.pyc
+*.egg-info/
