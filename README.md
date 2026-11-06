@@ -29,9 +29,37 @@ Data and adapters are not in git:
   (`train.jsonl`, `test.jsonl`, `images/`)
 - trained adapters (`work_dirs/<run>/adapter.pt`): shared separately (see the releases page)
 
+## Results
+
+Best adapter: **run 5** (`work_dirs/signdir_r16_nav1536`; Kaggle 2x T4, 1 epoch from run 4). Slow decoding, IoU >= 0.3;
+details, the preprocessing sweep and the live RealSense test are in [`signdir/RESULTS.md`](signdir/RESULTS.md).
+
+| Test set | det F1 | det recall | text exact | direction acc | type acc | e2e F1 |
+|---|---|---|---|---|---|---|
+| test_real: 68 own RealSense photos | 0.691 | 0.622 | 0.655 | 0.667 | 0.619 | 0.230 |
+| test_nav: 220 stairs / obstacle images | 0.772 | 0.697 | 0.955 | 0.910 | 1.000 | 0.668 |
+| test_all: 537 all-signs images | 0.791 | 0.736 | 0.833 | 0.946 | 0.942 | 0.656 |
+| reviewed test: 247 hand-checked direction-sign images | 0.395 | 0.357 | 0.444 | 0.593 | - | 0.132 |
+
+Reviewed test across runs (e2e F1 needs box, text and arrow all right):
+
+| Model | det F1 | e2e F1 |
+|---|---|---|
+| base LocateAnything-3B | 0.105 | 0.000 |
+| run 2: real images only | 0.300 | 0.085 |
+| run 3: + synthetic signs | 0.295 | 0.092 |
+| run 4: + all-signs task | 0.309 | 0.113 |
+| run 4-up: trained on 1536 px enlarged images (eval at 1536 px) | 0.389 | 0.145 |
+| run 5: + RealSense photos, door plates / handwritten, stairs + obstacles | 0.395 | 0.132 |
+
+On RealSense frames, `--pre gamma+clahe+up1536` (contrast + enlarge to the training resolution) gives det F1 0.746 and
+direction accuracy 0.680 vs 0.743 / 0.627 without preprocessing (52 sign photos).
+
 ## Usage
 
 ```bash
+python -m signdir.live --source realsense --adapter work_dirs/signdir_r16_nav1536 \
+    --pre gamma+clahe+up1536                                                # RealSense: signs + distance + obstacles
 python -m signdir.live --adapter work_dirs/signdir_r16_synth1536            # webcam
 python -m signdir.live --adapter work_dirs/... --image a.jpg b.jpg          # images
 python -m signdir.evaluate --adapter work_dirs/... --mode slow              # test-set metrics
