@@ -170,16 +170,82 @@ def _iou(a, b):
     return ix * iy / u if u > 0 else 0.0
 
 
-def parse(answer: str, w: int, h: int):
-    """[{"text", "direction", "bbox"}] from '<ref>Delhi | left</ref><box><x1><y1><x2><y2></box>...' (pixels).
-    Repeats of an earlier item (same text, box IoU > 0.5: the model sometimes loops) are dropped."""
-    out = []
+def parse(answer: str, w: int, h: int, max_repeat: int | None = None):
+    """[{"text", "direction", "bbox"}] from '<ref>Delhi | left</ref><box><x1><y1><x2><y2></box>...' (pixels), plus
+    "type" for the all-signs task ('<ref>No Smoking | none | prohibition</ref>...').
+    Repeats of an earlier item (same text, box IoU > 0.5: the model sometimes loops) are dropped. With max_repeat,
+    a label (text + direction) is kept at most that many times: the model's loops repeat one label with boxes
+    stepping across the image (on the reviewed test set, preds whose label occurs >= 3 times are 94% false)."""
+    out, seen = [], {}
     for m in ITEM.finditer(answer):
         label = m.group(1)
-        text, _, d = label.rpartition("|")
-        text, d = (text.strip(), d.strip().lower()) if text else (label.strip(), "")
+        parts = [p.strip() for p in label.rsplit("|", 2)]
+        sign_type = parts.pop().lower() if len(parts) == 3 else ""  # all-signs task: text | direction | type
+        text, d = (parts[0], parts[1].lower()) if len(parts) == 2 else (label.strip(), "")
         x1, y1, x2, y2 = (int(g) for g in m.groups()[1:])
         it = {"text": text, "direction": d, "bbox": [x1 / 1000 * w, y1 / 1000 * h, x2 / 1000 * w, y2 / 1000 * h]}
+        if sign_type:
+            it["type"] = sign_type
+        key = (text.lower(), d)
+        if max_repeat is not None and seen.get(key, 0) >= max_repeat:
+            continue
         if not any(o["text"].lower() == text.lower() and _iou(o["bbox"], it["bbox"]) > 0.5 for o in out):
             out.append(it)
+            seen[key] = seen.get(key, 0) + 1
     return out
+
+
+MAX_REPEAT = 3  # default label cap for predictions (parse); ground truth is parsed without it
+
+
+def _upscaled(image, min_long_side):
+    """The image enlarged (bicubic) so its long side is >= min_long_side; the processor only ever downscales, so a
+    512 px station photo otherwise reaches the vision encoder as ~180 tokens and small sign text is unreadable."""
+    if not min_long_side or max(image.size) >= min_long_side:
+        return image
+    s = min_long_side / max(image.size)
+    return image.resize((round(image.width * s), round(image.height * s)), resample=3)
+
+
+def _tiles(w, h, grid, overlap):
+    """grid x grid boxes (x1, y1, x2, y2) covering a w x h image, neighbours overlapping by `overlap` of a tile."""
+    tw, th = w / (grid - (grid - 1) * overlap), h / (grid - (grid - 1) * overlap)
+    sx, sy = tw * (1 - overlap), th * (1 - overlap)
+    return [(round(i * sx), round(j * sy), round(min(w, i * sx + tw)), round(min(h, j * sy + th)))
+            for j in range(grid) for i in range(grid)]
+
+
+def _overlaps(a, b, iou_thr=0.3, contain_thr=0.6):
+    ix, iy = max(0, min(a[2], b[2]) - max(a[0], b[0])), max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return _iou(a, b) > iou_thr or (small > 0 and inter / small > contain_thr)
+
+
+def detect(model, processor, tokenizer, image, prompt, mode="slow", upscale=0, tiles=0, overlap=0.25,
+           max_repeat=MAX_REPEAT, max_new_tokens=512):
+    """Items (pixel boxes of `image`) of the full image, plus, with tiles=G, of a G x G grid of overlapping zoomed
+    tiles. A tile item is added only where the full-image pass (and earlier tiles) found nothing (box overlap) and
+    only if it does not touch an inner tile edge (a sign cut by the tile border is read from the neighbour / full
+    image instead). Every pass is upscaled to a long side of at least `upscale` (tiles: at least the full image's).
+    Returns (items, raw answers)."""
+    W, H = image.size
+    full = _upscaled(image, upscale)
+    answers = [predict(model, processor, tokenizer, full, prompt, mode=mode, max_new_tokens=max_new_tokens)]
+    items = parse(answers[0], W, H, max_repeat)
+    if tiles and tiles > 1:
+        target = max(upscale or 0, max(full.size))
+        for (x1, y1, x2, y2) in _tiles(W, H, tiles, overlap):
+            crop = _upscaled(image.crop((x1, y1, x2, y2)), target)
+            ans = predict(model, processor, tokenizer, crop, prompt, mode=mode, max_new_tokens=max_new_tokens)
+            answers.append(ans)
+            tw, th, m = x2 - x1, y2 - y1, 0.01
+            for it in parse(ans, tw, th, max_repeat):
+                a, b, c, d = it["bbox"]
+                if (x1 > 0 and a <= m * tw) or (y1 > 0 and b <= m * th) or \
+                        (x2 < W and c >= (1 - m) * tw) or (y2 < H and d >= (1 - m) * th):
+                    continue  # cut by an inner tile edge
+                it = {**it, "bbox": [a + x1, b + y1, c + x1, d + y1]}
+                if not any(_overlaps(it["bbox"], o["bbox"]) for o in items):
+                    items.append(it)
+    return items, answers

@@ -1,0 +1,37 @@
+{
+ "Integrated Camera: Integrated C": {
+  "indoor": {
+   "a": 0.9963721042181382,
+   "b": 1.0857238970582341,
+   "width": 1280,
+   "model": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+   "date": "2026-11-01",
+   "samples": [
+    {
+     "true_m": 1.0,
+     "estimate_m": 0.9712460339069366,
+     "spread_m": 0.3327744545381161,
+     "corrected_m": 0.9653051716776095
+    },
+    {
+     "true_m": 2.0,
+     "estimate_m": 2.1492685079574585,
+     "spread_m": 0.39428210915250683,
+     "corrected_m": 2.2866383706250084
+    },
+    {
+     "true_m": 3.0,
+     "estimate_m": 3.0599868297576904,
+     "spread_m": 0.09788029416069768,
+     "corrected_m": 3.3556672589001595
+    },
+    {
+     "true_m": 4.0,
+     "estimate_m": 2.9628639221191406,
+     "spread_m": 0.6346798548751122,
+     "corrected_m": 3.240188164906703
+    }
+   ]
+  }
+ }
+}

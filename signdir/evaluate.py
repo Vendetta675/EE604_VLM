@@ -7,8 +7,14 @@ Per image, predictions are matched one-to-one to ground-truth items (greedy by I
   e2e P/R/F1     a prediction counts only if box, text (similarity >= TEXT_OK) and direction are all right
   neg FP rate    images without a direction sign that got any prediction
 Reported for all test images and for the human-reviewed ones only (once data/reviewed.jsonl exists).
+Each test row is asked with its own prompt. For the all-signs task (--test test_all.jsonl, build_sft --all) items also
+carry a sign type: "type acc" is its accuracy on matched items and e2e then also needs the right type.
 
   python -m signdir.evaluate [--adapter work_dirs/signdir_r16] [--mode hybrid|fast|slow] [--limit N]
+  python -m signdir.evaluate --adapter ... --mode slow --test test_all.jsonl
+  python -m signdir.evaluate --adapter ... --mode slow --upscale 1024 --tiles 2 --sources indoor
+    --upscale / --tiles / --max_repeat: inference options of la.detect (predictions are capped at la.MAX_REPEAT
+    repeats of a label by default; --max_repeat 0 reproduces the uncapped numbers)
 """
 from __future__ import annotations
 
@@ -19,9 +25,10 @@ from pathlib import Path
 from PIL import Image
 
 from signdir import la
-from signdir.build_sft import PROMPT, SFT
+from signdir.build_sft import PROMPT_ALL, SFT
 
 IOU, TEXT_OK = 0.3, 0.8
+INDOOR = ("subway-guide", "taipei-station", "wayfinding-sign", "exit-sign")
 
 
 def iou(a, b):
@@ -59,7 +66,7 @@ def match(pred, gt):
 
 
 def score(rows):
-    s = dict(n_pred=0, n_gt=0, det=0, e2e=0, text_sim=0.0, text_exact=0, dir_ok=0, neg=0, neg_fp=0)
+    s = dict(n_pred=0, n_gt=0, det=0, e2e=0, text_sim=0.0, text_exact=0, dir_ok=0, neg=0, neg_fp=0, typed=0, type_ok=0)
     for r in rows:
         pred, gt = r["pred"], r["gt"]
         s["n_pred"] += len(pred)
@@ -73,14 +80,18 @@ def score(rows):
             s["text_sim"] += sim
             s["text_exact"] += sim == 1.0
             s["dir_ok"] += p["direction"] == g["direction"]
-            s["e2e"] += sim >= TEXT_OK and p["direction"] == g["direction"]
+            type_ok = "type" not in g or p.get("type") == g["type"]  # untyped labels: type not scored
+            s["typed"] += "type" in g
+            s["type_ok"] += "type" in g and type_ok
+            s["e2e"] += sim >= TEXT_OK and p["direction"] == g["direction"] and type_ok
     f1 = lambda tp: 2 * tp / (s["n_pred"] + s["n_gt"]) if s["n_pred"] + s["n_gt"] else 0.0
     d = max(1, s["det"])
     return {"images": len(rows), "gt_items": s["n_gt"], "pred_items": s["n_pred"],
             "det_P": s["det"] / max(1, s["n_pred"]), "det_R": s["det"] / max(1, s["n_gt"]), "det_F1": f1(s["det"]),
             "text_sim": s["text_sim"] / d, "text_exact": s["text_exact"] / d, "direction_acc": s["dir_ok"] / d,
             "e2e_P": s["e2e"] / max(1, s["n_pred"]), "e2e_R": s["e2e"] / max(1, s["n_gt"]), "e2e_F1": f1(s["e2e"]),
-            "neg_images": s["neg"], "neg_FP_rate": s["neg_fp"] / max(1, s["neg"])}
+            "neg_images": s["neg"], "neg_FP_rate": s["neg_fp"] / max(1, s["neg"]),
+            "type_acc": s["type_ok"] / s["typed"] if s["typed"] else None}
 
 
 def confusion(rows):
@@ -99,21 +110,37 @@ def main():
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--mode", default="hybrid", choices=["hybrid", "fast", "slow"])
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--test", default="test.jsonl", help="test file in data/sft")
+    ap.add_argument("--upscale", type=int, default=0, help="enlarge images to at least this long side (px)")
+    ap.add_argument("--tiles", type=int, default=0, help="also read a G x G grid of zoomed tiles (la.detect)")
+    ap.add_argument("--max_repeat", type=int, default=la.MAX_REPEAT, help="label cap on predictions (0: none)")
+    ap.add_argument("--sources", default=None, help="comma list of sources, or 'indoor'")
+    ap.add_argument("--prompt", default="row", choices=["row", "all"],
+                    help="row: each test row's own prompt; all: the all-signs prompt (e.g. on the reviewed direction "
+                         "test, whose labels also hold arrowless signs; types are not scored there)")
     a = ap.parse_args()
     model, processor, tokenizer = la.load(adapter=a.adapter)
     model.eval()
     rows = []
-    tests = [json.loads(l) for l in (SFT / "test.jsonl").open()][:a.limit]
+    tests = [json.loads(l) for l in (SFT / a.test).open()]
+    if a.sources:
+        keep = set(INDOOR if a.sources == "indoor" else a.sources.split(","))
+        tests = [t for t in tests if t["source"] in keep]
+    tests = tests[:a.limit]
     for k, t in enumerate(tests):
         im = Image.open(SFT / "images" / t["image"]).convert("RGB")
-        ans = la.predict(model, processor, tokenizer, im, PROMPT, mode=a.mode)
+        pred, answers = la.detect(model, processor, tokenizer, im, PROMPT_ALL if a.prompt == "all" else t["conversations"][0]["value"], mode=a.mode,
+                                  upscale=a.upscale, tiles=a.tiles, max_repeat=a.max_repeat or None)
         gt_ans = t["conversations"][1]["value"]
-        rows.append({"image": t["image"], "source": t["source"], "reviewed": t["reviewed"], "answer": ans,
-                     "pred": la.parse(ans, im.width, im.height), "gt": la.parse(gt_ans, im.width, im.height)})
+        rows.append({"image": t["image"], "source": t["source"], "reviewed": t["reviewed"], "answer": answers[0],
+                     "tile_answers": answers[1:], "pred": pred, "gt": la.parse(gt_ans, im.width, im.height)})
         if k % 20 == 0:
             print(f"{k}/{len(tests)}", flush=True)
     name = Path(a.adapter).name if a.adapter else "base"
-    out = SFT / f"eval_{name}_{a.mode}.json"
+    tag = (f"_up{a.upscale}" if a.upscale else "") + (f"_t{a.tiles}" if a.tiles else "") + \
+        (f"_{a.sources.replace(',', '+').replace('/', '-')}" if a.sources else "") + \
+        ("_pall" if a.prompt == "all" else "")
+    out = SFT / f"eval_{name}_{a.mode}{'' if a.test == 'test.jsonl' else '_' + Path(a.test).stem}{tag}.json"
     res = {"all": score(rows), "reviewed": score([r for r in rows if r["reviewed"]])}
     res["by_source"] = {s: score([r for r in rows if r["source"] == s]) for s in sorted({r["source"] for r in rows})}
     out.write_text(json.dumps({"metrics": res, "rows": rows}, ensure_ascii=False, indent=1))
@@ -121,7 +148,7 @@ def main():
         m = res[k]
         print(f"{k:9s} imgs {m['images']:4d}  det F1 {m['det_F1']:.3f}  text sim {m['text_sim']:.3f} "
               f"exact {m['text_exact']:.3f}  dir acc {m['direction_acc']:.3f}  e2e F1 {m['e2e_F1']:.3f}  "
-              f"neg FP {m['neg_FP_rate']:.2f}")
+              f"neg FP {m['neg_FP_rate']:.2f}" + (f"  type acc {m['type_acc']:.3f}" if m["type_acc"] is not None else ""))
     print("direction confusion (truth -> predicted):", *confusion(rows), sep="\n")
     print("->", out)
 

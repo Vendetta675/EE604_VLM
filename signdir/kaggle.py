@@ -8,6 +8,16 @@ re-push. Writes .tmp/kaggle/kernel_<mode>/ (run.py + kernel-metadata.json); push
   python -m signdir.kaggle smoke   bf16 vs fp16 smoke (time / loss / memory), 3 data-parallel steps, 4-image eval
   python -m signdir.kaggle train   run 3 (real + synthetic, 2 epochs, batch 8 over the GPUs) + slow-mode eval;
                                    the adapter, logs and eval json land in the kernel output
+  python -m signdir.kaggle train4  run 4: from run 3's adapter (init/adapter.pt in the dataset), 1 epoch over the
+                                   direction task + the all-signs task (build_sft --all), eval on test.jsonl and
+                                   test_all.jsonl
+  python -m signdir.kaggle train6  run 6: real signs first (signdir.build_run6: real rows x2, RealSense x3, small
+                                   synthetic + nav replay), init = best earlier adapter, eval test_real only
+  python -m signdir.kaggle train5  run 5: from run 4's adapter (init/adapter.pt), 1 epoch over room plates +
+                                   handwritten notes (synth_paper), the navigation task (stairs up/down, obstacles;
+                                   public_nav), the labelled RealSense photos, and 2,500 replayed run-4 rows
+                                   (build_sft --all --paper --nav --realsense --replay 2500); eval on test_all,
+                                   test_nav, test_real and test
 """
 from __future__ import annotations
 
@@ -21,7 +31,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 USER = "gouravsingh2005"
 DATASET = f"{USER}/signdir-sft"
-OUT = "signdir_r16_synth1536"
+OUT = {"smoke": "smoke", "train": "signdir_r16_synth1536", "train4": "signdir_r16_all1536",
+       "train5": "signdir_r16_nav1536", "train5fast": "signdir_r16_nav1536",
+       "train6": "signdir_r16_real6"}
 
 RUN = r'''
 import glob, os, subprocess, sys, tarfile, base64, io, json, time
@@ -81,8 +93,37 @@ src = os.path.dirname(glob.glob("/kaggle/input/**/train.jsonl", recursive=True)[
 print("data", src, os.listdir(src), flush=True)
 sft = f"{W}/data/sft"
 os.makedirs(sft, exist_ok=True)
-for f in ("train.jsonl", "test.jsonl"):
-    sh(f"cp {src}/{f} {sft}/")
+for f in ("train.jsonl", "test.jsonl", "test_all.jsonl", "test_nav.jsonl", "test_real.jsonl"):
+    if os.path.exists(f"{src}/{f}"):
+        sh(f"cp {src}/{f} {sft}/")
+init = glob.glob("/kaggle/input/**/adapter.pt", recursive=True)  # init/adapter.pt (zipped dir may unpack nested)
+print("init adapter:", init, flush=True)
+if MODE == "train5fast":  # fits ~3.5 h: subsample run 5's train rows per group, RealSense photos twice
+    import random
+    rows = [json.loads(l) for l in open(f"{sft}/train.jsonl")]
+    def grp(r):
+        if r["source"].startswith("realsense"):
+            return "realsense"
+        if r["conversations"][0]["value"].startswith("Find the stairs"):
+            return "nav"
+        return "paper" if r["source"] == "synthetic_paper" else "replay"
+    keep = {"replay": 800, "paper": 900, "nav": 1200}
+    by = {}
+    for r in rows:
+        by.setdefault(grp(r), []).append(r)
+    rng = random.Random(0)
+    out = by.get("realsense", []) * 2
+    for g, n in keep.items():
+        rng.shuffle(by[g])
+        out += by[g][:n]
+    rng.shuffle(out)
+    open(f"{sft}/train.jsonl", "w").write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out))
+    print("train5fast rows:", {g: len(v) for g, v in by.items()}, "->", len(out), flush=True)
+if MODE in ("train4", "train5", "train5fast", "train6") and not init:
+    raise SystemExit("init adapter.pt missing from the dataset (upload with --dir-mode zip)")
+if init:
+    os.makedirs("/tmp/init", exist_ok=True)
+    sh(f"cp {init[0]} /tmp/init/adapter.pt")
 if os.path.exists(f"{src}/images.tar"):
     os.makedirs(f"{sft}/images", exist_ok=True)
     sh(f"tar -xf {src}/images.tar -C {sft}/images")
@@ -104,9 +145,30 @@ if MODE == "smoke":
     sh("python -m signdir.qlora --smoke 6")
     sh(f"{tr} --out work_dirs/smoke --max_steps 3 --accum 2")
     sh("python -m signdir.evaluate --adapter work_dirs/smoke --mode slow --limit 4")
-else:
+elif MODE == "train":
     sh(f"{tr} --out work_dirs/{OUT} --epochs 2 --accum {accum} --save 25")
     sh(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow")
+elif MODE == "train5":
+    sh(f"{tr} --out work_dirs/{OUT} --epochs 1 --accum {accum} --save 25 --init /tmp/init")
+    for t in ("test_real.jsonl", "test_nav.jsonl", "test_all.jsonl", "test.jsonl"):
+        if os.path.exists(f"{sft}/{t}"):
+            sh(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow --test {t}", check=False)
+elif MODE == "train6":  # train_run6.jsonl (signdir.build_run6) is packaged as train.jsonl; big evals run locally
+    sh(f"{tr} --out work_dirs/{OUT} --epochs 1 --accum {accum} --save 25 --init /tmp/init")
+    sh(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow --test test_real.jsonl", check=False)
+elif MODE == "train5fast":
+    sh(f"{tr} --out work_dirs/{OUT} --epochs 1 --accum {accum} --save 25 --init /tmp/init")
+    # one test set per GPU in parallel; test_all / test are evaluated locally on the downloaded adapter
+    ps = [subprocess.Popen(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow --test {t}"
+                           f" > /kaggle/working/eval_{t}.log 2>&1", shell=True,
+                           env={**os.environ, "CUDA_VISIBLE_DEVICES": str(g % max(1, n_gpu))})
+          for g, t in enumerate(("test_nav.jsonl", "test_real.jsonl"))]
+    for p in ps:
+        p.wait()
+else:
+    sh(f"{tr} --out work_dirs/{OUT} --epochs 1 --accum {accum} --save 25 --init /tmp/init")
+    sh(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow --test test_all.jsonl", check=False)
+    sh(f"python -m signdir.evaluate --adapter work_dirs/{OUT} --mode slow", check=False)
 sh(f"cp {sft}/eval_*.json /kaggle/working/", check=False)
 print("RUN_DONE", flush=True)
 '''
@@ -122,10 +184,10 @@ def code_b64():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
-    assert mode in ("smoke", "train"), mode
+    assert mode in OUT, mode
     d = ROOT / ".tmp" / "kaggle" / f"kernel_{mode}"
     d.mkdir(parents=True, exist_ok=True)
-    run = RUN.replace("__MODE__", repr(mode)).replace("__OUT__", repr(OUT)).replace("__CODE__", repr(code_b64()))
+    run = RUN.replace("__MODE__", repr(mode)).replace("__OUT__", repr(OUT[mode])).replace("__CODE__", repr(code_b64()))
     (d / "run.py").write_text(run)
     meta = {"id": f"{USER}/signdir-{mode}", "title": f"signdir-{mode}", "code_file": "run.py", "language": "python",
             "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_tpu": False,

@@ -11,6 +11,8 @@ the loss is scaled (GradScaler) and the LoRA weights stay in float32.
   python -m signdir.qlora --out work_dirs/signdir_r16 [--epochs 2 --lr 1e-4 --accum 8 --r 16]
   torchrun --nproc_per_node 2 -m signdir.qlora --out ... --accum 4
   python -m signdir.qlora --smoke [N]   forward/backward on the first N samples (default 1): time, loss, memory
+  python -m signdir.qlora --init work_dirs/signdir_r16_synth1536 ...   continue from an adapter (same --r)
+  python -m signdir.qlora --recipe data/sft/recipe_up.json ...           other data (signdir.build_upscaled)
 """
 from __future__ import annotations
 
@@ -29,11 +31,11 @@ from signdir import la
 from signdir.build_sft import SFT
 
 
-def dataset(processor, tokenizer, max_len):
+def dataset(processor, tokenizer, max_len, recipe=None):
     import eaglevl.train.locany_finetune_magi_stream as F
     tokenizer.model_max_length = max_len
     processor.tokenizer = tokenizer
-    meta = json.loads((SFT / "recipe.json").read_text())["signdir"]
+    meta = json.loads(Path(recipe or SFT / "recipe.json").read_text())["signdir"]
     return F.LazySupervisedDatasetMTP("signdir", meta, processor, block_size=6)
 
 
@@ -59,18 +61,20 @@ def main():
     ap.add_argument("--save", type=int, default=100, help="optimizer steps between adapter saves")
     ap.add_argument("--max_steps", type=int, default=None, help="stop after this many optimizer steps (testing)")
     ap.add_argument("--smoke", type=int, nargs="?", const=1, default=0)
+    ap.add_argument("--init", default=None, help="adapter directory to start from (adapter.pt)")
+    ap.add_argument("--recipe", default=None, help="data recipe json (default data/sft/recipe.json)")
     a = ap.parse_args()
     world, rank = int(os.environ.get("WORLD_SIZE", 1)), int(os.environ.get("RANK", 0))
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     if world > 1:
         dist.init_process_group("nccl")
     torch.manual_seed(0)
-    model, processor, tokenizer = la.load(train=True, r=a.r)
+    model, processor, tokenizer = la.load(adapter=a.init, train=True, r=a.r)
     model.language_model.config.use_cache = False
     model.gradient_checkpointing_enable({"use_reentrant": False})
     model.train()
     model.vision_model.eval()  # frozen
-    ds = dataset(processor, tokenizer, a.max_len)
+    ds = dataset(processor, tokenizer, a.max_len, a.recipe)
     params = [p for p in model.parameters() if p.requires_grad]
     fp16 = la.DTYPE == torch.float16
     if fp16:
