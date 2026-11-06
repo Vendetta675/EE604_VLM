@@ -36,7 +36,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from signdir import la
+from signdir import la, preprocess
 from signdir.build_sft import PROMPT, PROMPT_ALL, PROMPT_NAV
 
 # up-left / up-right are spoken as "go straight": the teacher labels (and so the run-2 adapter) call most straight
@@ -280,6 +280,8 @@ def main():
     ap.add_argument("--width", type=int, default=1280, help="requested webcam width (16:9)")
     ap.add_argument("--image", nargs="+", help="image files instead of the webcam")
     ap.add_argument("--long_side", type=int, default=1536, help="as in training (build_sft --long_side)")
+    ap.add_argument("--pre", default=None,
+                    help="frame preprocessing before the model (signdir.preprocess spec, e.g. gamma+clahe+up1536)")
     ap.add_argument("--mode", default="slow", choices=["slow", "hybrid", "fast"])
     ap.add_argument("--repeat", type=float, default=8.0, help="seconds before the same command is spoken again")
     ap.add_argument("--no-voice", action="store_true")
@@ -339,8 +341,9 @@ def main():
         t0 = time.time()
         nav = a.nav_every > 0 and n % a.nav_every == a.nav_every - 1
         prompt = PROMPT_NAV if nav else PROMPT_ALL if a.task == "all" else PROMPT
-        answer = la.predict(model, processor, tokenizer, rgb, prompt, mode=a.mode)
-        items = la.parse(answer, rgb.width, rgb.height)
+        x, _ = preprocess.apply(rgb, a.pre)
+        answer = la.predict(model, processor, tokenizer, x, prompt, mode=a.mode)
+        items = la.parse(answer, rgb.width, rgb.height)  # boxes are 0..1000 normalized: same for the enlarged frame
         for it in items:
             it["bbox"] = [v / s for v in it["bbox"]]
         t1 = time.time()

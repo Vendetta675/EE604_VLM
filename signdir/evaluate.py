@@ -24,7 +24,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from signdir import la
+from signdir import la, preprocess
 from signdir.build_sft import PROMPT_ALL, SFT
 
 IOU, TEXT_OK = 0.3, 0.8
@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--tiles", type=int, default=0, help="also read a G x G grid of zoomed tiles (la.detect)")
     ap.add_argument("--max_repeat", type=int, default=la.MAX_REPEAT, help="label cap on predictions (0: none)")
     ap.add_argument("--sources", default=None, help="comma list of sources, or 'indoor'")
+    ap.add_argument("--pre", default=None, help="frame preprocessing spec of signdir.preprocess, e.g. clahe+up1536")
     ap.add_argument("--prompt", default="row", choices=["row", "all"],
                     help="row: each test row's own prompt; all: the all-signs prompt (e.g. on the reviewed direction "
                          "test, whose labels also hold arrowless signs; types are not scored there)")
@@ -129,8 +130,11 @@ def main():
     tests = tests[:a.limit]
     for k, t in enumerate(tests):
         im = Image.open(SFT / "images" / t["image"]).convert("RGB")
-        pred, answers = la.detect(model, processor, tokenizer, im, PROMPT_ALL if a.prompt == "all" else t["conversations"][0]["value"], mode=a.mode,
+        x, sc = preprocess.apply(im, a.pre)
+        pred, answers = la.detect(model, processor, tokenizer, x, PROMPT_ALL if a.prompt == "all" else t["conversations"][0]["value"], mode=a.mode,
                                   upscale=a.upscale, tiles=a.tiles, max_repeat=a.max_repeat or None)
+        for p in pred:
+            p["bbox"] = [v / sc for v in p["bbox"]]
         gt_ans = t["conversations"][1]["value"]
         rows.append({"image": t["image"], "source": t["source"], "reviewed": t["reviewed"], "answer": answers[0],
                      "tile_answers": answers[1:], "pred": pred, "gt": la.parse(gt_ans, im.width, im.height)})
@@ -139,7 +143,7 @@ def main():
     name = Path(a.adapter).name if a.adapter else "base"
     tag = (f"_up{a.upscale}" if a.upscale else "") + (f"_t{a.tiles}" if a.tiles else "") + \
         (f"_{a.sources.replace(',', '+').replace('/', '-')}" if a.sources else "") + \
-        ("_pall" if a.prompt == "all" else "")
+        ("_pall" if a.prompt == "all" else "") + (f"_pre-{a.pre}" if a.pre else "")
     out = SFT / f"eval_{name}_{a.mode}{'' if a.test == 'test.jsonl' else '_' + Path(a.test).stem}{tag}.json"
     res = {"all": score(rows), "reviewed": score([r for r in rows if r["reviewed"]])}
     res["by_source"] = {s: score([r for r in rows if r["source"] == s]) for s in sorted({r["source"] for r in rows})}
